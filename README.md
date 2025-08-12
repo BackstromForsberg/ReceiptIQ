@@ -11,8 +11,15 @@ The purpose of the project is to ingest a pdf of any receipt and to return JSON 
 
 ## Required Dependencies
 
+To Run:
+
 - Docker
-- Python
+
+To Develop:
+
+- Docker
+- Python / pip3
+- Node / npm
 
 ## Installation
 
