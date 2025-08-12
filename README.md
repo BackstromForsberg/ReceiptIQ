@@ -23,7 +23,7 @@ To Develop:
 
 ## Installation
 
-TBD
+Dockerfiles take care of installation if running as proof of concept
 
 ## Usage
 
