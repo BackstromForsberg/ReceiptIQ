@@ -20,6 +20,10 @@ TBD
 
 ## Usage
 
+Docker Compose:
+
+- Run `docker compose up` from root. Flask API will be served on port 5001
+
 Flask API:
 
 - Go to server directory `cd packages/server`
