@@ -1,19 +1,23 @@
 # Dockerfile (development)
 FROM python:3.12-slim
 
-# Faster logs & no .pyc files
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    FLASK_APP=app.py \
+    FLASK_RUN_HOST=0.0.0.0 \
+    FLASK_RUN_PORT=5000 \
+    FLASK_DEBUG=1
 
 WORKDIR /app
 
-# Dev deps
-COPY requirements-dev.txt .
+# Install deps (great for caching)
+COPY requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
 
-# Copy your app (compose will mount the live code over this)
+# Copy source (compose will bind-mount over this in dev)
 COPY . .
 
 EXPOSE 5000
 
-# Run Flask’s built-in server with debug & reload
-CMD ["flask", "run", "--host=0.0.0.0", "--port=5000", "--debug"]
+# Launch Flask dev server (debug + auto-reload)
+CMD ["python", "-m", "flask", "run"]

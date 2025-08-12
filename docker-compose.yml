@@ -1,7 +1,7 @@
 services:
   client:
     build: ./client
-    container_name: nextjs_client
+    container_name: client
     ports:
       - "3000:3000"
     volumes:
@@ -9,9 +9,15 @@ services:
       - /app/node_modules
     environment:
       - NEXT_TELEMETRY_DISABLED=1
+      - NODE_ENV=development
+      - API_BASE_URL=http://api:5000
+    depends_on:
+      - api
+    networks:
+      - receipt-iq-net
   api:
     build: ./server
-    container_name: flask_api
+    container_name: api
     ports:
       - "5001:5000"
     volumes:
@@ -20,3 +26,9 @@ services:
       # Flask 3 prefers FLASK_DEBUG over FLASK_ENV
       - FLASK_APP=server/app.py
       - FLASK_DEBUG=1
+    networks:
+      - receipt-iq-net
+
+networks:
+  receipt-iq-net:
+    driver: bridge
