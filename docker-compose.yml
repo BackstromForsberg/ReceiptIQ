@@ -1,11 +1,11 @@
 services:
   flask_api:
-    build: ./packages/server
+    build: ./server
     ports:
       - "5001:5000"
     volumes:
       - .:/app
     environment:
       # Flask 3 prefers FLASK_DEBUG over FLASK_ENV
-      - FLASK_APP=packages/server/app.py
+      - FLASK_APP=server/app.py
       - FLASK_DEBUG=1
