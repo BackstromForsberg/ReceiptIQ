@@ -9,6 +9,11 @@ Receipt IQ is a proof of concept project using
 
 The purpose of the project is to ingest a pdf of any receipt and to return JSON to the front end. Optionally, using agentic AI, you can translate the receipt contents into a foreign language and/or get live foreign currency conversion.
 
+## Required Dependencies
+
+- Docker
+- Python
+
 ## Installation
 
 TBD
