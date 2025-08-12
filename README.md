@@ -15,7 +15,11 @@ TBD
 
 ## Usage
 
-TBD
+Flask API:
+
+- Go to server directory `cd packages/server`
+- Run `python app.py`
+- Visit `http://127.0.0.1:5000` for Hello World message
 
 ## Contributing
 
