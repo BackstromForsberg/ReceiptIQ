@@ -1,6 +1,7 @@
 services:
   client:
     build: ./client
+    container_name: nextjs_client
     ports:
       - "3000:3000"
     volumes:
@@ -8,8 +9,9 @@ services:
       - /app/node_modules
     environment:
       - NEXT_TELEMETRY_DISABLED=1
-  flask_api:
+  api:
     build: ./server
+    container_name: flask_api
     ports:
       - "5001:5000"
     volumes:
