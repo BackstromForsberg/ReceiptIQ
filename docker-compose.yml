@@ -1,4 +1,13 @@
 services:
+  client:
+    build: ./client
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./client:/app
+      - /app/node_modules
+    environment:
+      - NEXT_TELEMETRY_DISABLED=1
   flask_api:
     build: ./server
     ports:
