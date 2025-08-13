@@ -21,3 +21,31 @@ export async function getHello() {
     throw err;
   }
 }
+
+export async function sendPDFReceiptForOCR(
+  arrayBuffer: ArrayBuffer,
+  filename = "upload.jpg"
+): Promise<any> {
+  try {
+    const response = await fetch(`${API}/ocr`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/pdf", // Different if PNG
+        "X-Filename": filename, // Optional, passed to backend for metadata
+      },
+      body: arrayBuffer,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Server error: ${response.status} ${errorText}`);
+    }
+
+    const result = await response.json();
+    console.log("OCR result:", result);
+    return result;
+  } catch (err) {
+    console.error("Error sending receipt:", err);
+    throw err;
+  }
+}

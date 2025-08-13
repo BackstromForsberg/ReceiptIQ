@@ -1,6 +1,7 @@
 "use client";
 
-import React, { useCallback } from "react";
+import { sendPDFReceiptForOCR } from "@/app/actions";
+import React, { useCallback, useEffect } from "react";
 import { useDropzone } from "react-dropzone";
 
 export const FileUpload = () => {
@@ -23,6 +24,14 @@ export const FileUpload = () => {
       reader.readAsArrayBuffer(file);
     });
   }, []);
+
+  useEffect(() => {
+    if (fileContent) {
+      sendPDFReceiptForOCR(fileContent, fileName || "upload.jpg")
+        .then((result) => console.log("OCR result:", result))
+        .catch((err) => console.error("Error during OCR:", err));
+    }
+  }, [fileContent, fileName]);
   const { getRootProps, getInputProps } = useDropzone({ onDrop });
 
   return (
