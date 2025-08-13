@@ -1,0 +1,10 @@
+Flask==3.0.3
+# Optional: better file-change detection inside Docker
+watchdog>=6.0.0
+strands-agents-tools>=0.1.0
+ollama>=0.1.0
+pathlib2>=2.3.0
+pdf2image>=1.16.0
+pytesseract>=0.3.8
+Pillow>=8.3.0
+PyMuPDF>=1.26.3

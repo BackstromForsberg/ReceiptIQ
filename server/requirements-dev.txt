@@ -1,3 +1,0 @@
-Flask==3.0.3
-# Optional: better file-change detection inside Docker
-watchdog==4.0.1
