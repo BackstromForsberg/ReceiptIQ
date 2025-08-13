@@ -11,8 +11,8 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Install deps (great for caching)
-COPY requirements-dev.txt ./
-RUN pip install --no-cache-dir -r requirements-dev.txt
+COPY requirements-backend.txt ./
+RUN pip install --no-cache-dir -r requirements-backend.txt
 
 # Copy source (compose will bind-mount over this in dev)
 COPY . .
