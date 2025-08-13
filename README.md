@@ -27,17 +27,12 @@ Dockerfiles take care of installation if running as proof of concept
 
 ## Usage
 
-Docker Compose:
+Run Project w/ Docker:
 
+- Have Docker Running
 - Run `docker compose up` from root.
 - Flask API will be served on port 5001
 - UI will be served on port 3000
-
-Flask API:
-
-- Go to server directory `cd packages/server`
-- Run `python app.py`
-- Visit `http://127.0.0.1:5000` for Hello World message
 
 ## Contributing
 
