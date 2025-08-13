@@ -1,4 +1,5 @@
 import React from "react";
+import { FileUpload } from "./fileUpload/FileUpload";
 
 export const GridLayout = () => {
   return (
@@ -13,7 +14,7 @@ export const GridLayout = () => {
         <div className="mt-10 grid grid-cols-1 gap-4 sm:mt-16 lg:grid-cols-6 lg:grid-rows-2">
           <div className="flex p-px lg:col-span-4">
             <div className="w-full overflow-hidden rounded-lg bg-white shadow-sm outline outline-black/5 max-lg:rounded-t-4xl lg:rounded-tl-4xl dark:bg-gray-800 dark:shadow-none dark:outline-white/15">
-              <p className="m-10">PDF Drag and Drop Placeholder</p>
+              <FileUpload />
             </div>
           </div>
           <div className="flex p-px lg:col-span-2">

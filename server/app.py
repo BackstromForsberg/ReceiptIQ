@@ -6,7 +6,7 @@ app = Flask(__name__)
 # Define a route
 @app.route("/hello")
 def hello_world():
-    return "Hello, World!"
+    return "Hello, Receipt IQ!"
 
 # Define a route for the favicon to remove 404 log
 @app.route('/favicon.ico')
