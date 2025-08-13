@@ -3,8 +3,13 @@
 import { sendPDFReceiptForOCR } from "@/app/actions";
 import React, { useCallback, useEffect } from "react";
 import { useDropzone } from "react-dropzone";
+import { OCRResponse } from "../ReceiptOutput";
 
-export const FileUpload = () => {
+type Props = {
+  setOCRResponse: React.Dispatch<React.SetStateAction<OCRResponse | null>>;
+};
+
+export const FileUpload = ({ setOCRResponse }: Props) => {
   const [fileName, setFileName] = React.useState<string | null>(null);
   const [fileContent, setFileContent] = React.useState<ArrayBuffer | null>(
     null
@@ -16,7 +21,6 @@ export const FileUpload = () => {
       reader.onabort = () => console.log("file reading was aborted");
       reader.onerror = () => console.log("file reading has failed");
       reader.onload = () => {
-        // Do whatever you want with the file contents
         const binaryStr = reader.result;
         setFileContent(binaryStr as ArrayBuffer);
         console.log(binaryStr);
@@ -27,8 +31,11 @@ export const FileUpload = () => {
 
   useEffect(() => {
     if (fileContent) {
-      sendPDFReceiptForOCR(fileContent, fileName || "upload.jpg")
-        .then((result) => console.log("OCR result:", result))
+      sendPDFReceiptForOCR(fileContent, fileName || "upload.pdf")
+        .then((result) => {
+          console.log("OCR result:", result);
+          setOCRResponse(result as OCRResponse);
+        })
         .catch((err) => console.error("Error during OCR:", err));
     }
   }, [fileContent, fileName]);
@@ -48,6 +55,7 @@ export const FileUpload = () => {
             onClick={() => {
               setFileName(null);
               setFileContent(null);
+              setOCRResponse(null);
             }}
           >
             Clear File
