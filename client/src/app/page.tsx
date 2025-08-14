@@ -11,7 +11,7 @@ export default async function Home() {
         <GridLayout />
         <p>Connected to Flask API: {message}</p>
       </main>
-      <footer className="row-start-3 flex flex-wrap items-center justify-center">
+      <footer className="row-start-3 flex flex-wrap items-center gap-6 justify-center">
         <a
           className="flex items-center gap-2 hover:underline hover:underline-offset-4"
           href="https://github.com/BackstromForsberg/ReceiptIQ"
@@ -25,7 +25,22 @@ export default async function Home() {
             width={16}
             height={16}
           />
-          Powered by Larry & Ollama
+          GitHub
+        </a>
+        <a
+          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
+          href="https://github.com/goagiq/VisionOCR/"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <Image
+            aria-hidden
+            src="/file.svg"
+            alt="File icon"
+            width={16}
+            height={16}
+          />
+          Powered by Larry & Ollama - Vision OCR
         </a>
       </footer>
     </div>

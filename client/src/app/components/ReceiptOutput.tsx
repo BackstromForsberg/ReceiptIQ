@@ -44,7 +44,8 @@ export const ReceiptOutput = ({ ocrOutput }: Props) => {
   return (
     <div className="m-10">
       <h2 className="text-lg font-semibold">
-        {parsed_data["Company Name"]} - Receipt OCR Output
+        {parsed_data["Company Name"] ? `${parsed_data["Company Name"]} -` : ""}{" "}
+        Receipt OCR Output
       </h2>
       <h5>Date: {parsed_data.Date}</h5>
       <div className="mt-4">
