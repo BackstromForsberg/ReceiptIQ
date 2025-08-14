@@ -7,12 +7,16 @@ import { OCRResponse } from "../ReceiptOutput";
 
 type Props = {
   setOCRResponse: React.Dispatch<React.SetStateAction<OCRResponse | null>>;
+  setIsLoading: React.Dispatch<React.SetStateAction<boolean>>;
 };
 
-export const FileUpload = ({ setOCRResponse }: Props) => {
+export const FileUpload = ({ setOCRResponse, setIsLoading }: Props) => {
   const [fileName, setFileName] = React.useState<string | null>(null);
   const [fileContent, setFileContent] = React.useState<ArrayBuffer | null>(
     null
+  );
+  const [promptText, setPromptText] = React.useState<string>(
+    "Upload Receipt (PDF or PNG)"
   );
 
   const borderColor = fileName ? "border-blue-500" : "border-gray-300";
@@ -33,19 +37,41 @@ export const FileUpload = ({ setOCRResponse }: Props) => {
   }, []);
 
   useEffect(() => {
-    if (fileContent) {
-      sendPDFReceiptForOCR(
-        fileContent,
-        fileName || "upload.pdf",
-        fileName?.endsWith(".png") ? "png" : "pdf"
-      )
-        .then((result) => {
-          console.log("OCR result:", result);
-          setOCRResponse(result as OCRResponse);
-        })
-        .catch((err) => console.error("Error during OCR:", err));
-    }
-  }, [fileContent, fileName, setOCRResponse]);
+    if (!fileContent) return;
+
+    let cancelled = false; // cleanup flag
+    // optional: keep in a ref if you want cross-effect protection
+    // reqIdRef.current = reqId;
+
+    setOCRResponse(null); // clear old UI immediately
+    setPromptText("Analyzing Receipt…");
+    setIsLoading(true);
+
+    (async () => {
+      try {
+        const result = await sendPDFReceiptForOCR(
+          fileContent,
+          fileName || "upload.pdf",
+          fileName?.endsWith(".png") ? "png" : "pdf"
+        );
+
+        if (cancelled) return; // ignore if effect was re-run/unmounted
+
+        setPromptText(`${fileName ?? "File"} analyzed successfully!`);
+        setOCRResponse(result as OCRResponse);
+      } catch (err) {
+        if (!cancelled) console.error("Error during OCR:", err);
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true; // prevents late updates
+    };
+    // Only rerun when inputs change (setter fns are stable; don’t include them)
+  }, [fileContent, fileName, setIsLoading, setOCRResponse]);
+
   const { getRootProps, getInputProps } = useDropzone({ onDrop });
 
   return (
@@ -55,7 +81,7 @@ export const FileUpload = ({ setOCRResponse }: Props) => {
         {...getRootProps()}
       >
         <input {...getInputProps()} />
-        <div>Upload Receipt PDF</div>
+        <div>{promptText}</div>
       </div>
       {fileName && (
         <div className="mt-4 text-sm text-white">
@@ -66,6 +92,7 @@ export const FileUpload = ({ setOCRResponse }: Props) => {
               setFileName(null);
               setFileContent(null);
               setOCRResponse(null);
+              setPromptText("Upload Receipt (PDF or PNG)");
             }}
           >
             Clear File
