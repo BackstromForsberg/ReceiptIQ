@@ -32,6 +32,8 @@ services:
       - OLLAMA_HOST=http://ollama:11434
     networks:
       - receipt-iq-net
+    depends_on:
+      - ollama
 
   # Ollama service for running models
   ollama:
@@ -59,6 +61,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
+    networks:
+      - receipt-iq-net
 
 networks:
   receipt-iq-net:
