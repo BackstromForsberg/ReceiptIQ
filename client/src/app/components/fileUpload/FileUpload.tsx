@@ -31,14 +31,18 @@ export const FileUpload = ({ setOCRResponse }: Props) => {
 
   useEffect(() => {
     if (fileContent) {
-      sendPDFReceiptForOCR(fileContent, fileName || "upload.pdf")
+      sendPDFReceiptForOCR(
+        fileContent,
+        fileName || "upload.pdf",
+        fileName?.endsWith(".png") ? "png" : "pdf"
+      )
         .then((result) => {
           console.log("OCR result:", result);
           setOCRResponse(result as OCRResponse);
         })
         .catch((err) => console.error("Error during OCR:", err));
     }
-  }, [fileContent, fileName]);
+  }, [fileContent, fileName, setOCRResponse]);
   const { getRootProps, getInputProps } = useDropzone({ onDrop });
 
   return (
