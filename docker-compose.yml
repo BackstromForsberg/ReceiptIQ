@@ -1,4 +1,5 @@
 services:
+  # Frontend service using Next.js
   client:
     build: ./client
     container_name: client
@@ -15,6 +16,8 @@ services:
       - api
     networks:
       - receipt-iq-net
+
+  # Flask API service
   api:
     build: ./server
     container_name: api
@@ -26,9 +29,50 @@ services:
       # Flask 3 prefers FLASK_DEBUG over FLASK_ENV
       - FLASK_APP=server/app.py
       - FLASK_DEBUG=1
+      - OLLAMA_HOST=http://ollama:11434
     networks:
       - receipt-iq-net
+
+  # Ollama service for running models
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434" # optional: expose to host
+    volumes:
+      - ollama_models:/root/.ollama # model cache
+    environment:
+      - OLLAMA_KEEP_ALIVE=5m
+      # # If you’re behind a proxy, set these (or pass via .env)
+      # - HTTP_PROXY=${HTTP_PROXY:-}
+      # - HTTPS_PROXY=${HTTPS_PROXY:-}
+      # - NO_PROXY=localhost,127.0.0.1,ollama
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "sh",
+          "-c",
+          "curl -sf http://localhost:11434/api/tags >/dev/null || exit 1",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 30
 
 networks:
   receipt-iq-net:
     driver: bridge
+
+volumes:
+  ollama_models:
+
+    # ---------------- GPU (optional) ----------------
+    # For NVIDIA GPUs on Linux, uncomment ONE of the following blocks:
+    # device_requests:
+    #   - driver: nvidia
+    #     count: all
+    #     capabilities: [gpu]
+    # Or run compose with: docker compose --profile gpu up
+    # profiles: ["gpu"]
+    # ------------------------------------------------
