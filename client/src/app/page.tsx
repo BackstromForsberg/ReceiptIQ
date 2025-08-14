@@ -22,8 +22,8 @@ export default async function Home() {
             aria-hidden
             src="/file.svg"
             alt="File icon"
-            width={36}
-            height={36}
+            width={32}
+            height={32}
           />
           GitHub
         </a>
@@ -52,8 +52,8 @@ export default async function Home() {
             aria-hidden
             src="/file.svg"
             alt="File icon"
-            width={36}
-            height={36}
+            width={32}
+            height={32}
           />
           Powered by Larry (Vision OCR)
         </a>
