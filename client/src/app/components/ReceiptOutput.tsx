@@ -75,6 +75,7 @@ export const ReceiptOutput = ({ ocrOutput }: Props) => {
             <table className="mt-4 w-full table-auto border-collapse">
               <thead>
                 <tr>
+                  <th className="border px-4 py-2">Category</th>
                   <th className="border px-4 py-2">Description</th>
                   <th className="border px-4 py-2">Quantity</th>
                   <th className="border px-4 py-2">Unit Price</th>
@@ -84,6 +85,7 @@ export const ReceiptOutput = ({ ocrOutput }: Props) => {
               <tbody>
                 {parsed_data.Items.map((item, index) => (
                   <tr key={index}>
+                    <td className="border px-4 py-2">{item.category}</td>
                     <td className="border px-4 py-2">{item.description}</td>
                     <td className="border px-4 py-2">{item.quantity}</td>
                     <td className="border px-4 py-2">{item.unit_price}</td>
