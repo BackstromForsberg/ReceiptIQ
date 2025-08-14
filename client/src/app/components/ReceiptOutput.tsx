@@ -33,19 +33,12 @@ type Props = {
 export const ReceiptOutput = ({ ocrOutput }: Props) => {
   if (!ocrOutput) {
     return (
-      <div className="m-10">
-        No Output currently available. Upload a PDF Receipt to see output.
-      </div>
+      <div className="m-10 w-200">Upload a PDF Receipt to see output.</div>
     );
   }
 
-  const {
-    confidence,
-    extraction_method,
-    parsed_data,
-    processing_time,
-    raw_text,
-  } = ocrOutput;
+  const { confidence, extraction_method, parsed_data, processing_time } =
+    ocrOutput;
 
   console.log(parsed_data);
   return (

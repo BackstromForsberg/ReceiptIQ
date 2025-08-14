@@ -14,6 +14,9 @@ export const FileUpload = ({ setOCRResponse }: Props) => {
   const [fileContent, setFileContent] = React.useState<ArrayBuffer | null>(
     null
   );
+
+  const borderColor = fileName ? "border-blue-500" : "border-gray-300";
+
   const onDrop = useCallback((acceptedFiles: File[]) => {
     acceptedFiles.forEach((file) => {
       const reader = new FileReader();
@@ -47,12 +50,15 @@ export const FileUpload = ({ setOCRResponse }: Props) => {
 
   return (
     <div className="p-10 m-20">
-      <div className="border-dashed border-2 p-10" {...getRootProps()}>
+      <div
+        className={`border-dashed border-2 ${borderColor} p-10 h-100 flex items-center justify-center cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors rounded-lg`}
+        {...getRootProps()}
+      >
         <input {...getInputProps()} />
-        <div className="text-center m-0-auto">Upload Receipt PDF</div>
+        <div>Upload Receipt PDF</div>
       </div>
       {fileName && (
-        <div className="mt-4 text-sm text-gray-600">
+        <div className="mt-4 text-sm text-white">
           Selected file: <strong>{fileName}</strong>
           <button
             className="ml-4 text-blue-500 hover:underline"
