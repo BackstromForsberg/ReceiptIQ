@@ -343,13 +343,15 @@ class OptimizedReceiptOCRScanner:
     # ----- Parsing -----
     def _parse_ocr_text(self, text: str) -> dict:
         """
-        Robust parser for Vision OCR AND text-based PDFs (PyPDF2).
-        Key fixes:
-        - Do NOT treat 'Total' in the column header as summary start (require a money amount).
-        - Multi-layout items: single-line, 2/3/4-line, and a token-based fallback.
-        - Reconcile Subtotal/Tax/Total from parsed items.
+        Robust for Vision OCR and text-based PDFs:
+        - Finds multi-line table headers and starts after them.
+        - Scans the full document (no early 'summary' cutoff).
+        - Handles single-line and stacked (2/3/4-line) item layouts.
+        - Captures Subtotal/Tax/Total even when amounts are on following lines.
+        - Reconciles totals from items.
         """
         import re
+        from typing import Optional, List
 
         # ---------- helpers ----------
         MONEY = r"\$?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})"
@@ -357,6 +359,7 @@ class OptimizedReceiptOCRScanner:
         INT_RE = re.compile(r"\d+")
 
         def normalize_ws(s: str) -> str:
+            # normalize odd spaces, pipes, tabs, collapse spaces
             s = (s.replace("\u00a0", " ")
                 .replace("\u2009", " ")
                 .replace("\u202f", " ")
@@ -368,7 +371,7 @@ class OptimizedReceiptOCRScanner:
         def is_money(s: str) -> bool:
             return bool(MONEY_RE.fullmatch(s.strip()))
 
-        def first_money(s: str):
+        def first_money(s: str) -> Optional[str]:
             m = MONEY_RE.search(s)
             return m.group(0) if m else None
 
@@ -385,36 +388,47 @@ class OptimizedReceiptOCRScanner:
         def money_to_float(s: str) -> float:
             return float(s.replace("$", "").replace(",", "").replace(" ", ""))
 
-        def maybe_money_to_float(s: str):
+        def maybe_money_to_float(s: Optional[str]) -> Optional[float]:
             try:
-                return money_to_float(s)
+                return money_to_float(s) if s else None
             except Exception:
                 return None
 
-        def find_qty(s: str):
+        def find_qty(s: str) -> Optional[str]:
             m = INT_RE.search(s.strip())
             return m.group(0) if m else None
 
-        def looks_like_header(s: str) -> bool:
+        def is_header_token(s: str) -> bool:
             ss = s.lower()
-            return any(k in ss for k in ("description", "qty", "quantity", "unit price", "price", "total"))
+            return ss in {"description", "qty", "quantity", "unit price", "price", "total"}
 
-        # Summary detection MUST include an amount either on the same line or the next non-empty line.
-        def is_summary_line(lines, i) -> bool:
-            ln = lines[i].lower()
-            if re.search(r"\bsub\s*total\b|^subtotal\b|\b(tax|vat)\b|\bgrand\s+total\b", ln):
-                # summary keywords beyond just 'total'
-                return True
-            if re.search(r"\btotal\b", ln):
-                # require an amount on same line or next non-empty line
-                if MONEY_RE.search(lines[i]):
-                    return True
-                j = i + 1
-                while j < len(lines) and not lines[j].strip():
-                    j += 1
-                if j < len(lines) and MONEY_RE.search(lines[j]):
-                    return True
-            return False
+        def looks_like_header_line(s: str) -> bool:
+            ss = s.lower()
+            return any(tok in ss for tok in ("description", "qty", "quantity", "unit price", "price", "total"))
+
+        def is_summary_keyword(s: str) -> Optional[str]:
+            ss = s.lower()
+            if re.search(r"\bsub\s*total\b|^subtotal\b", ss): return "subtotal"
+            if re.search(r"\b(?:tax|vat|gst|sales\s*tax)\b", ss): return "tax"
+            if re.search(r"\b(?:grand\s+)?total\b", ss): return "total"
+            return None
+
+        def grab_amount_inline_or_following(lines: List[str], i: int, max_lookahead: int = 3) -> Optional[str]:
+            # same line
+            m = MONEY_RE.search(lines[i])
+            if m:
+                return norm_money(m.group(0))
+            # next non-empty lines
+            hops = 0
+            j = i + 1
+            while j < len(lines) and hops < max_lookahead:
+                if lines[j].strip():
+                    m2 = MONEY_RE.search(lines[j])
+                    if m2:
+                        return norm_money(m2.group(0))
+                    hops += 1
+                j += 1
+            return None
 
         # ---------- pre-process ----------
         raw_lines = text.splitlines()
@@ -428,7 +442,7 @@ class OptimizedReceiptOCRScanner:
                 continue
             if ":" in ln:             # meta like "Phone:", "Guest Name:"
                 continue
-            if looks_like_header(ln) or re.search(r"\b(receipt|invoice|statement)\b", ln, re.I):
+            if looks_like_header_line(ln) or re.search(r"\b(receipt|invoice|statement)\b", ln, re.I):
                 continue
             if MONEY_RE.search(ln):
                 continue
@@ -451,18 +465,24 @@ class OptimizedReceiptOCRScanner:
                     date_val = m.group().strip()
                     break
 
-        # ---------- locate table header (if present) ----------
-        header_idx = None
-        for i, ln in enumerate(low):
-            if ("description" in ln) and ("total" in ln):
-                header_idx = i
+        # ---------- locate multi-line header block ----------
+        header_start = header_end = None
+        for i, ln in enumerate(lines):
+            if "description" in ln.lower():
+                # walk forward while header tokens present
+                j = i
+                seen = 0
+                while j < len(lines) and is_header_token(lines[j]):
+                    seen += 1
+                    header_end = j
+                    j += 1
+                if seen >= 2:  # at least Description + another header token
+                    header_start = i
                 break
 
-        # ---------- summary detectors ----------
-        SUBTOTAL_LINE = re.compile(rf"\bsub\s*total\b\s*:?\s*(?P<amt>{MONEY})\b", re.I)
-        TAX_LINE      = re.compile(rf"\b(?:tax|vat)\b.*?:?\s*(?P<amt>{MONEY})\b", re.I)
-        TOTAL_LINE    = re.compile(rf"\b(?:grand\s+)?total\b\s*:?\s*(?P<amt>{MONEY})\b", re.I)
+        start_i = (header_end + 1) if header_end is not None else 0
 
+        # ---------- patterns ----------
         SINGLE_ITEM = re.compile(
             rf"""^
                 (?P<desc>.+?)\s+
@@ -476,32 +496,26 @@ class OptimizedReceiptOCRScanner:
         items = []
         subtotal_val = tax_val = total_val = None
 
-        # determine item scan bounds: start after header; end at real summary (with amounts)
-        start_i = (header_idx + 1) if header_idx is not None else 0
-
-        end_i = len(lines)
-        for k in range(start_i, len(lines)):
-            if is_summary_line(lines, k):
-                end_i = k
-                break
-
+        # ---------- scan ALL lines from start_i to end (no early cutoff) ----------
         i = start_i
-        while i < end_i:
+        while i < len(lines):
             ln = lines[i]
 
-            # Grab summary if it sneaks in early (rare)
-            if subtotal_val is None:
-                m = SUBTOTAL_LINE.search(ln)
-                if m: subtotal_val = norm_money(m.group("amt"))
-            if tax_val is None:
-                m = TAX_LINE.search(ln)
-                if m: tax_val = norm_money(m.group("amt"))
-            if total_val is None:
-                m = TOTAL_LINE.search(ln)
-                if m: total_val = norm_money(m.group("amt"))
+            # Capture summary anywhere (amount may be on following lines)
+            key = is_summary_keyword(ln)
+            if key == "subtotal" and not subtotal_val:
+                got = grab_amount_inline_or_following(lines, i)
+                if got: subtotal_val = got
+            elif key == "tax" and not tax_val:
+                got = grab_amount_inline_or_following(lines, i)
+                if got: tax_val = got
+            elif key == "total" and not total_val:
+                # Accept 'grand total' or 'total' with amount inline/next lines.
+                got = grab_amount_inline_or_following(lines, i)
+                if got: total_val = got
 
-            # Skip clearly non-item lines
-            if looks_like_header(ln) or (":" in ln and not ln.lower().startswith("total")):
+            # Skip non-item lines (headers or obvious meta)
+            if looks_like_header_line(ln) or (":" in ln and not ln.lower().startswith("total")):
                 i += 1
                 continue
 
@@ -519,44 +533,44 @@ class OptimizedReceiptOCRScanner:
                 continue
 
             # B) two-line: desc / (qty unit total)
-            if i + 1 < end_i:
+            if i + 1 < len(lines):
                 l1 = lines[i + 1]
                 qty = find_qty(l1)
-                twom = two_moneys(l1)
-                if qty and twom and not looks_like_header(ln) and not is_money(ln):
+                monies = re.findall(MONEY, l1)
+                if qty and len(monies) >= 2 and not looks_like_header_line(ln) and not is_money(ln):
                     items.append({
                         "description": ln.strip(),
                         "quantity": qty,
-                        "unit_price": norm_money(twom[0]),
-                        "total": norm_money(twom[1]),
+                        "unit_price": norm_money(monies[0]),
+                        "total": norm_money(monies[1]),
                         "category": ""
                     })
                     i += 2
                     continue
 
             # C) three-line: desc / qty / (unit total)
-            if i + 2 < end_i:
+            if i + 2 < len(lines):
                 l1, l2 = lines[i + 1], lines[i + 2]
                 qty = find_qty(l1)
-                twom = two_moneys(l2)
-                if qty and twom and not looks_like_header(ln) and not is_money(ln):
+                monies = re.findall(MONEY, l2)
+                if qty and len(monies) >= 2 and not looks_like_header_line(ln) and not is_money(ln):
                     items.append({
                         "description": ln.strip(),
                         "quantity": qty,
-                        "unit_price": norm_money(twom[0]),
-                        "total": norm_money(twom[1]),
+                        "unit_price": norm_money(monies[0]),
+                        "total": norm_money(monies[1]),
                         "category": ""
                     })
                     i += 3
                     continue
 
             # D) four-line: desc / qty / unit / total
-            if i + 3 < end_i:
+            if i + 3 < len(lines):
                 l1, l2, l3 = lines[i + 1], lines[i + 2], lines[i + 3]
                 qty = find_qty(l1)
                 unit = first_money(l2)
                 tot  = first_money(l3)
-                if qty and unit and tot and not looks_like_header(ln) and not is_money(ln):
+                if qty and unit and tot and not looks_like_header_line(ln) and not is_money(ln):
                     items.append({
                         "description": ln.strip(),
                         "quantity": qty,
@@ -567,15 +581,12 @@ class OptimizedReceiptOCRScanner:
                     i += 4
                     continue
 
-            # E) token-based fallback (very common for text-PDF):
-            #    use last two money tokens and the last integer before them as qty
+            # E) token fallback: last two monies + integer before them
             tokens = ln.split()
             money_positions = [(idx, t) for idx, t in enumerate(tokens) if is_money(t)]
             if len(money_positions) >= 2:
-                # rightmost two monies -> unit, total (or total, unit; try to detect by magnitude)
                 idx2, m2 = money_positions[-1]
                 idx1, m1 = money_positions[-2]
-                # qty = last integer token before first money
                 qty_idx = None
                 for qidx in range(idx1 - 1, -1, -1):
                     if INT_RE.fullmatch(tokens[qidx]):
@@ -584,13 +595,12 @@ class OptimizedReceiptOCRScanner:
                 if qty_idx is not None and qty_idx > 0:
                     desc = " ".join(tokens[:qty_idx]).strip()
                     unit, tot = m1, m2
-                    # If unit looks bigger than total, swap (OCR glitches)
                     try:
                         if money_to_float(unit) > money_to_float(tot):
                             unit, tot = tot, unit
                     except Exception:
                         pass
-                    if desc and not looks_like_header(desc) and not is_money(desc):
+                    if desc and not looks_like_header_line(desc) and not is_money(desc):
                         items.append({
                             "description": desc,
                             "quantity": tokens[qty_idx],
@@ -601,17 +611,7 @@ class OptimizedReceiptOCRScanner:
                         i += 1
                         continue
 
-            # nothing matched
             i += 1
-
-        # Collect summary AFTER items region as well (safer)
-        for k in range(end_i, len(lines)):
-            if subtotal_val is None:
-                m = SUBTOTAL_LINE.search(lines[k]);  subtotal_val = norm_money(m.group("amt")) if m else subtotal_val
-            if tax_val is None:
-                m = TAX_LINE.search(lines[k]);       tax_val = norm_money(m.group("amt")) if m else tax_val
-            if total_val is None:
-                m = TOTAL_LINE.search(lines[k]);     total_val = norm_money(m.group("amt")) if m else total_val
 
         # ---------- reconciliation ----------
         computed_subtotal = None
@@ -621,10 +621,11 @@ class OptimizedReceiptOCRScanner:
             if totals:
                 computed_subtotal = round(sum(totals) + 1e-9, 2)
 
-        def parse_money_safe(s: str | None) -> float | None:
-            if not s: return None
-            try: return money_to_float(s)
-            except Exception: return None
+        def parse_money_safe(s: Optional[str]) -> Optional[float]:
+            try:
+                return money_to_float(s) if s else None
+            except Exception:
+                return None
 
         if computed_subtotal is not None:
             sub_f = parse_money_safe(subtotal_val)
@@ -637,6 +638,7 @@ class OptimizedReceiptOCRScanner:
             total_val = f"${sub_f + tax_f:.2f}"
 
         if total_val is None:
+            # fallback: choose the max money in the entire doc
             monies = [money_to_float(m.group()) for m in MONEY_RE.finditer("\n".join(lines))]
             if monies:
                 total_val = f"${max(monies):.2f}"
@@ -651,6 +653,7 @@ class OptimizedReceiptOCRScanner:
         if total_val: out["Total"] = total_val
         out["raw_text"] = text
         return out
+
 
 
 
