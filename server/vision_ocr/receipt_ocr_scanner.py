@@ -1,887 +1,866 @@
 #!/usr/bin/env python3
 """
-Optimized Receipt OCR Scanner - Byte-buffer (in-memory) version
-All image/PDF processing uses bytes instead of file paths so you can
-wire it directly to an API upload or array buffer.
+Receipt OCR Scanner (buffer-based; robust text-PDF vs image handling)
+- Accepts raw bytes, base64 strings, or data URLs
+- Detects PDF vs image by content, not headers
+- Text-based PDFs -> PyPDF2 text extraction (no vision)
+- Image-based PDFs/images -> Vision model (Ollama) with optional hybrid pytesseract first
 """
 
-import sys
-import argparse
-import json
-import time
-import io
+import os, sys, io, re, json, time, base64, socket, logging, imghdr
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-import logging
+from typing import Dict, Optional, List, Tuple
 
-# Ollama integration
-try:
-    import ollama
-except ImportError:
-    print("Error: ollama package not found. Install with: pip install ollama")
-    sys.exit(1)
-
-# Optional: Traditional OCR for hybrid approach
+# ---------- Optional deps ----------
 try:
     import pytesseract
     from PIL import Image
-    TRADITIONAL_OCR_AVAILABLE = True
-except ImportError:
-    TRADITIONAL_OCR_AVAILABLE = False
-    print("Warning: pytesseract not available. Install with: pip install pytesseract pillow")
+    TRAD_OCR = True
+except Exception:
+    TRAD_OCR = False
+    print("Warning: pytesseract not available. `pip install pytesseract pillow` and install `tesseract-ocr` binary.")
 
-# Optional: OpenCV
 try:
     import cv2
     import numpy as np
-    OPENCV_AVAILABLE = True
-except ImportError:
-    OPENCV_AVAILABLE = False
-    print("Warning: opencv-python not available. Install with: pip install opencv-python")
+    OPENCV = True
+except Exception:
+    OPENCV = False
+    print("Warning: opencv-python not available. `pip install opencv-python` to enable cropping.")
 
-# Optional: PyMuPDF & PyPDF2 for PDFs
 try:
     import fitz  # PyMuPDF
-    PYMUPDF_AVAILABLE = True
-except ImportError:
-    PYMUPDF_AVAILABLE = False
+    PYMUPDF = True
+except Exception:
+    PYMUPDF = False
+    print("Warning: PyMuPDF not available. `pip install PyMuPDF` for PDF rendering.")
 
 try:
     import PyPDF2
-    PYPDF2_AVAILABLE = True
-except ImportError:
-    PYPDF2_AVAILABLE = False
+    PYPDF2 = True
+except Exception:
+    PYPDF2 = False
+    print("Warning: PyPDF2 not available. `pip install PyPDF2` for text-PDF extraction.")
 
-# Configure logging
+# ---------- Ollama + HTTP ----------
+try:
+    import requests
+except Exception:
+    print("Error: requests not found. `pip install requests`")
+    sys.exit(1)
+
+try:
+    import ollama
+except Exception:
+    print("Error: ollama not found. `pip install ollama`")
+    sys.exit(1)
+
+# ---------- Logging ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(), logging.FileHandler("receipt_ocr_optimized.log")]
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
+# ---------- Helpers ----------
+DATA_URL_RE = re.compile(r'^data:([-\w]+/[-\w+.]+);base64,')
 
-def _looks_like_pdf(data: bytes) -> bool:
-    # PDFs start with %PDF
-    return len(data) >= 4 and data[:4] == b"%PDF"
+def _env_ollama_host() -> str:
+    url = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
+    if url.startswith("//"): url = "http:" + url
+    if not url.startswith(("http://", "https://")): url = "http://" + url
+    return url.rstrip("/")
 
+def _split_host_port(url: str) -> Tuple[str, int]:
+    h = url.split("://", 1)[1]
+    h = h.split("/", 1)[0] if "/" in h else h
+    host, _, port = h.partition(":")
+    return host, int(port or "11434")
 
+def _wait_dns(host: str, timeout_s: float = 30):
+    end = time.time() + timeout_s
+    while True:
+        try:
+            socket.getaddrinfo(host, None)
+            return
+        except socket.gaierror:
+            if time.time() >= end:
+                raise RuntimeError(f"DNS resolve failed for '{host}' after {timeout_s}s")
+            time.sleep(0.5)
+
+def _wait_http(url: str, timeout_s: float = 120):
+    end = time.time() + timeout_s
+    tags = f"{url}/api/tags"
+    while True:
+        try:
+            r = requests.get(tags, timeout=2)
+            if r.ok:
+                return
+        except Exception:
+            pass
+        if time.time() >= end:
+            raise RuntimeError(f"Ollama not responding at {tags} after {timeout_s}s")
+        time.sleep(0.5)
+
+def _ensure_model(url: str, model: str, timeout_s: float = 900):
+    """Pull model if missing; stream status, fail on error/timeout."""
+    try:
+        resp = requests.get(f"{url}/api/tags", timeout=5)
+        if resp.ok and model in [m.get("name") for m in resp.json().get("models", [])]:
+            return
+    except Exception:
+        pass
+    log.info(f"Pulling model '{model}' ...")
+    s = requests.Session()
+    r = s.post(f"{url}/api/pull", json={"name": model}, stream=True, timeout=15)
+    r.raise_for_status()
+    start = time.time()
+    for line in r.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        if "error" in line.lower():
+            raise RuntimeError(f"ollama pull error: {line}")
+        if '"done":true' in line or '"status":"success"' in line or '"status":"downloaded"' in line:
+            break
+        if time.time() - start > timeout_s:
+            raise RuntimeError(f"Timed out pulling '{model}' after {timeout_s}s")
+    log.info(f"Model '{model}' ready")
+
+_OLLAMA_CLIENT = None
+def _ollama_client(ensure: Optional[str] = None):
+    """Lazy client; waits for DNS/HTTP; pulls model if missing."""
+    global _OLLAMA_CLIENT
+    if _OLLAMA_CLIENT is not None:
+        return _OLLAMA_CLIENT
+    url = _env_ollama_host()
+    host, _ = _split_host_port(url)
+    log.info(f"Ollama target: {url}")
+    _wait_dns(host, 30)
+    _wait_http(url, 120)
+    if ensure:
+        _ensure_model(url, ensure, 900)
+    _OLLAMA_CLIENT = ollama.Client(host=url)
+    return _OLLAMA_CLIENT
+
+def _normalize_to_bytes(x) -> bytes:
+    """
+    Accept:
+      - bytes/bytearray
+      - base64 string
+      - data URL string: data:<mime>;base64,<data>
+    Return bytes; raise on unsupported.
+    """
+    if isinstance(x, (bytes, bytearray)):
+        return bytes(x)
+    if isinstance(x, str):
+        s = x.strip()
+        m = DATA_URL_RE.match(s[:100])
+        if m:
+            try:
+                return base64.b64decode(s[m.end():], validate=True)
+            except Exception as e:
+                raise TypeError(f"Invalid data URL base64: {e}") from e
+        # try bare base64
+        try:
+            return base64.b64decode(s, validate=True)
+        except Exception:
+            raise TypeError("Expected raw bytes, base64 string, or data URL; got plain str.")
+    raise TypeError(f"Unsupported type for payload: {type(x)}")
+
+def _detect_payload_type(b: bytes) -> str:
+    """Return 'pdf' if starts with %PDF, 'image' for known images (or PIL-loadable), else 'unknown'."""
+    if len(b) >= 4 and b[:4] == b"%PDF":
+        return "pdf"
+    kind = imghdr.what(None, b)
+    if kind in {"png", "jpeg", "jpg", "bmp", "gif", "tiff"}:
+        return "image"
+    if TRAD_OCR:
+        try:
+            Image.open(io.BytesIO(b))
+            return "image"
+        except Exception:
+            pass
+    return "unknown"
+
+# ---------- Scanner ----------
 class OptimizedReceiptOCRScanner:
-    """Optimized Receipt OCR Scanner (buffer-based)"""
-
     def __init__(
         self,
         output_dir: str = "Reports",
-        model: str = "llava:7b",          # Use lighter model by default
-        max_image_size: int = 800,        # Max dimension for resizing
-        use_grayscale: bool = True,       # Convert to grayscale for text
-        use_hybrid_ocr: bool = True,      # Use traditional OCR first
-        compression_quality: int = 85     # JPEG compression quality
+        model: str = "llava:7b",
+        max_image_size: int = 800,
+        use_grayscale: bool = True,
+        use_hybrid_ocr: bool = True,
+        compression_quality: int = 85,
     ):
-        self.output_dir = Path(output_dir)
+        self.output_dir = Path(output_dir); self.output_dir.mkdir(exist_ok=True)
         self.model = model
         self.max_image_size = max_image_size
         self.use_grayscale = use_grayscale
-        self.use_hybrid_ocr = use_hybrid_ocr and TRADITIONAL_OCR_AVAILABLE
+        self.use_hybrid_ocr = use_hybrid_ocr and TRAD_OCR
         self.compression_quality = compression_quality
-
-        self.output_dir.mkdir(exist_ok=True)
-
-        # Load template for structured output
         self.template = self._load_template()
+        self.processing_stats = {"traditional_ocr_success": 0, "vision_model_used": 0}
+        log.info(f"Initialized OptimizedReceiptOCRScanner model={model} max={max_image_size} gray={use_grayscale} hybrid={self.use_hybrid_ocr}")
 
-        logger.info(f"Checking compatibility for model: {model}")
-        if not self._is_vision_model():
-            logger.warning(f"Model {model} may not be a vision model")
-            if not self._test_model_compatibility():
-                logger.warning(f"Model {model} failed vision compatibility test")
-                fallback = self._get_fallback_model()
-                if fallback != model:
-                    logger.info(f"Suggesting fallback model: {fallback}")
-
-        # Performance tracking
-        self.processing_stats = {
-            "traditional_ocr_success": 0,
-            "vision_model_used": 0,
-        }
-
-        logger.info(f"Initialized OptimizedReceiptOCRScanner with model: {model}")
-        logger.info(f"Max image size: {max_image_size}px, Grayscale: {use_grayscale}")
-        logger.info(f"Hybrid OCR: {self.use_hybrid_ocr}")
-
-    # -------------------- Templates / prompts --------------------
-
+    # ----- Template / Prompt -----
     def _load_template(self) -> Dict:
-        """Load the receipt template for structured output (optional)"""
-        template_path = Path("Template/llama3.2-vision_template.json")
-        if template_path.exists():
+        p = Path("Template/llama3.2-vision_template.json")
+        if p.exists():
             try:
-                with open(template_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                return json.load(open(p, "r", encoding="utf-8"))
             except Exception as e:
-                logger.warning(f"Could not load template: {e}")
-
-        # Default template
+                log.warning(f"Could not load template: {e}")
         return {
-            "Company Name": "",
-            "Receipt Number": "",
-            "Date": "",
-            "Time": "",
-            "Cashier": "",
-            "Store Location": "",
-            "Items": [],
-            "Subtotal": "",
-            "Sales Tax": "",
-            "Total": "",
-            "Payment Method": "",
-            "Change": "",
-            "Processing Notes": {
-                "Image Quality": "",
-                "Text Clarity": "",
-                "Layout Complexity": "",
-                "Extraction Confidence": ""
-            }
+            "Company Name": "", "Receipt Number": "", "Date": "", "Time": "",
+            "Cashier": "", "Store Location": "", "Items": [],
+            "Subtotal": "", "Sales Tax": "", "Total": "", "Payment Method": "", "Change": "",
+            "Processing Notes": {"Image Quality": "", "Text Clarity": "", "Layout Complexity": "", "Extraction Confidence": ""}
         }
 
-    def _get_optimized_prompt(self) -> str:
+    def _prompt(self) -> str:
         return (
-            "Analyze this receipt image and extract the key information.\n\n"
-            "Please provide the following information if visible:\n"
-            "- Store/Company name\n- Date and time\n- Items with prices (if listed)\n"
-            "- Subtotal\n- Tax amount\n- Total amount\n- Payment method\n\n"
-            "If any information is not visible or unclear, please indicate that.\n\n"
-            "Format your response clearly and be specific about what you can see in the image."
+            "Analyze this receipt image and extract:\n"
+            "- Store/Company name\n- Date and time\n- Item lines (description, qty, unit price, line total)\n"
+            "- Subtotal\n- Tax amount\n- Total amount\n- Payment method\n"
+            "If something is missing/unclear, say so. Be specific."
         )
 
-    # -------------------- Buffer-based image/PDF utilities --------------------
-
-    def _optimize_image_bytes(self, image_bytes: bytes) -> bytes:
-        """Optimize image bytes for faster processing (resize/grayscale/compress)."""
+    # ----- Imaging -----
+    def _optimize_image_bytes(self, b: bytes) -> bytes:
+        if not TRAD_OCR:
+            return b
         try:
-            if not TRADITIONAL_OCR_AVAILABLE:
-                # No PIL; just return original bytes
-                return image_bytes
-
-            with Image.open(io.BytesIO(image_bytes)) as img:
-                # Normalize to RGB
-                if img.mode != "RGB":
-                    img = img.convert("RGB")
-
-                # Resize if too large
+            with Image.open(io.BytesIO(b)) as img:
+                if img.mode != "RGB": img = img.convert("RGB")
                 if max(img.size) > self.max_image_size:
-                    ratio = self.max_image_size / max(img.size)
-                    new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
-                    img = img.resize(new_size, Image.Resampling.LANCZOS)
-                    logger.info(f"Resized image to {new_size}")
-
-                # Grayscale if configured (helps OCR/LLM on text receipts)
+                    r = self.max_image_size / max(img.size)
+                    img = img.resize((int(img.size[0]*r), int(img.size[1]*r)), Image.Resampling.LANCZOS)
                 if self.use_grayscale:
                     img = img.convert("L").convert("RGB")
-
-                # Save with compression
-                buffered = io.BytesIO()
-                img.save(
-                    buffered,
-                    format="JPEG",
-                    quality=self.compression_quality,
-                    optimize=True
-                )
-                return buffered.getvalue()
-
+                out = io.BytesIO()
+                img.save(out, format="JPEG", quality=self.compression_quality, optimize=True)
+                return out.getvalue()
         except Exception as e:
-            logger.error(f"Error optimizing image bytes: {e}")
-            # Fall back to original bytes
-            return image_bytes
+            log.error(f"optimize_image_bytes: {e}")
+            return b
 
-    def _crop_receipt_content(self, image_bgr: "np.ndarray") -> "np.ndarray":
-        """Crop receipt content using OpenCV - Conservative approach."""
-        if not OPENCV_AVAILABLE:
-            return image_bgr
-
-        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        _, binary = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY_INV)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return image_bgr
-
-        significant = [c for c in contours if cv2.contourArea(c) > 1000]
-        if not significant:
-            return image_bgr
-
-        x, y, w, h = cv2.boundingRect(max(significant, key=cv2.contourArea))
-        padding = 50
-        x = max(0, x - padding)
-        y = max(0, y - padding)
-        w = min(image_bgr.shape[1] - x, w + 2 * padding)
-        h = min(image_bgr.shape[0] - y, h + 2 * padding)
-        cropped = image_bgr[y:y + h, x:x + w]
-        logger.info(f"Cropped to {cropped.shape[1]}x{cropped.shape[0]}")
+    def _crop_receipt(self, img_bgr: "np.ndarray") -> "np.ndarray":
+        if not OPENCV:
+            return img_bgr
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        _, binr = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY_INV)
+        binr = cv2.morphologyEx(binr, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT,(5,5)))
+        cnts,_ = cv2.findContours(binr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = [c for c in cnts if cv2.contourArea(c) > 1000]
+        if not cnts: return img_bgr
+        x,y,w,h = cv2.boundingRect(max(cnts,key=cv2.contourArea))
+        pad=50; x=max(0,x-pad); y=max(0,y-pad); w=min(img_bgr.shape[1]-x,w+2*pad); h=min(img_bgr.shape[0]-y,h+2*pad)
+        cropped = img_bgr[y:y+h, x:x+w]
+        log.info(f"Cropped to {cropped.shape[1]}x{cropped.shape[0]}")
         return cropped
 
-    # -------------------- PDF handling (bytes) --------------------
-
-    def _analyze_pdf_content_bytes(self, pdf_bytes: bytes) -> Dict:
-        """Analyze PDF content (bytes) to see if it contains text or is image-based."""
-        if not PYPDF2_AVAILABLE:
-            return {"type": "image", "pages": 1, "note": "PyPDF2 not available"}
-
+    # ----- PDF (bytes) -----
+    def _analyze_pdf_bytes(self, b: bytes) -> Dict:
+        """Decide text-based vs image-based using PyPDF2; fall back to image if analysis fails."""
+        if not PYPDF2:
+            return {"type":"image","pages":1,"note":"PyPDF2 not available"}
         try:
-            reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-            if len(reader.pages) == 0:
-                return {"type": "empty", "pages": 0}
-            first = reader.pages[0]
-            text = first.extract_text() or ""
-            if text.strip() and len(text) > 50:
-                return {
-                    "type": "text",
-                    "pages": len(reader.pages),
-                    "text_length": len(text),
-                    "sample_text": (text[:200] + "...") if len(text) > 200 else text
-                }
-            return {"type": "image", "pages": len(reader.pages), "text_length": len(text)}
+            r = PyPDF2.PdfReader(io.BytesIO(b))
+            if not r.pages: return {"type":"empty","pages":0}
+            txt = (r.pages[0].extract_text() or "")
+            if txt.strip() and len(txt) > 30:  # a bit lenient
+                return {"type":"text","pages":len(r.pages),"text_length":len(txt)}
+            return {"type":"image","pages":len(r.pages),"text_length":len(txt)}
         except Exception as e:
-            logger.warning(f"Could not analyze PDF bytes: {e}")
-            return {"type": "image", "pages": 1, "error": str(e)}
+            log.warning(f"analyze_pdf_bytes: {e}")
+            return {"type":"image","pages":1,"error":str(e)}
 
-    def _extract_text_from_pdf_bytes(self, pdf_bytes: bytes) -> Dict:
-        """Extract text from a text-based PDF (bytes)."""
-        if not PYPDF2_AVAILABLE:
-            return {"error": "PDF text extraction unavailable (PyPDF2 not installed)"}
-        try:
-            reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-            text_content = ""
-            for i, page in enumerate(reader.pages, 1):
-                page_text = page.extract_text() or ""
-                if page_text:
-                    text_content += f"\n--- Page {i} ---\n{page_text}"
-            if not text_content.strip():
-                return {"error": "No text content found in PDF"}
-            parsed = self._parse_ocr_text(text_content)
-            return {
-                "raw_text": text_content,
-                "parsed_data": parsed,
-                "extraction_method": "pdf_text_extraction",
-                "confidence": "high" if len(text_content.strip()) > 100 else "low",
-            }
-        except Exception as e:
-            logger.error(f"PDF text extraction failed: {e}")
-            return {"error": f"PDF text extraction failed: {e}"}
-
-    def _pdf_to_image_bytes(self, pdf_bytes: bytes) -> Optional[bytes]:
-        """Render first page of PDF (bytes) to a cropped PNG (bytes)."""
-        if not (PYMUPDF_AVAILABLE and OPENCV_AVAILABLE and TRADITIONAL_OCR_AVAILABLE):
-            # Minimal fallback: return None to skip image conversion
+    def _pdf_firstpage_to_png_bytes(self, b: bytes) -> Optional[bytes]:
+        """
+        Render first page to PNG bytes using PyMuPDF only.
+        Cropping is optional (OpenCV). No PIL dependency required for baseline path.
+        """
+        if not PYMUPDF:
+            log.error("PyMuPDF not installed; cannot render PDF to image.")
             return None
         try:
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            if len(doc) == 0:
-                return None
-            page = doc[0]
-            mat = fitz.Matrix(2.0, 2.0)
-            pix = page.get_pixmap(matrix=mat)
-            img_png = pix.tobytes("png")
-            nparr = np.frombuffer(img_png, np.uint8)
-            img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            cropped = self._crop_receipt_content(img_bgr)
-
-            # Convert back to PIL and optimize similarly
-            rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(rgb)
-            if pil_img.mode != "RGB":
-                pil_img = pil_img.convert("RGB")
-            if max(pil_img.size) > self.max_image_size:
-                ratio = self.max_image_size / max(pil_img.size)
-                new_size = (int(pil_img.size[0] * ratio), int(pil_img.size[1] * ratio))
-                pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
-            if self.use_grayscale:
-                pil_img = pil_img.convert("L").convert("RGB")
-
-            buf = io.BytesIO()
-            pil_img.save(buf, format="PNG", optimize=True)
-            return buf.getvalue()
+            doc = fitz.open(stream=b, filetype="pdf")
+            if len(doc) == 0: return None
+            pix = doc[0].get_pixmap(matrix=fitz.Matrix(2.0,2.0))
+            png = pix.tobytes("png")
+            if OPENCV:
+                nparr = np.frombuffer(png, np.uint8)
+                bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                bgr = self._crop_receipt(bgr)
+                # re-encode cropped image as PNG
+                ok, enc = cv2.imencode(".png", bgr)
+                if ok:
+                    return enc.tobytes()
+                return png
+            return png
         except Exception as e:
-            logger.error(f"PDF to image conversion failed: {e}")
+            log.error(f"pdf->image failed: {e}")
             return None
 
-    # -------------------- OCR & LLM extraction (bytes) --------------------
-
-    def _extract_with_traditional_ocr_bytes(self, image_bytes: bytes) -> Dict:
-        """Extract text using pytesseract from image bytes."""
-        if not TRADITIONAL_OCR_AVAILABLE:
-            return {"error": "Traditional OCR not available"}
-
+    # ----- OCR paths -----
+    def _traditional_ocr(self, img_bytes: bytes) -> Dict:
+        if not TRAD_OCR:
+            return {"error":"Traditional OCR not available. Install tesseract or disable hybrid OCR."}
         try:
-            with Image.open(io.BytesIO(image_bytes)) as img:
-                if img.mode != "RGB":
-                    img = img.convert("RGB")
+            with Image.open(io.BytesIO(img_bytes)) as img:
+                if img.mode != "RGB": img = img.convert("RGB")
                 if max(img.size) > 1200:
-                    ratio = 1200 / max(img.size)
-                    new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
-                    img = img.resize(new_size, Image.Resampling.LANCZOS)
+                    r = 1200 / max(img.size)
+                    img = img.resize((int(img.size[0]*r), int(img.size[1]*r)), Image.Resampling.LANCZOS)
                 text = pytesseract.image_to_string(img)
-
-            if not text.strip():
-                return {"error": "No text extracted", "method": "traditional_ocr"}
-
-            parsed = self._parse_ocr_text(text)
-            return {
-                "raw_text": text,
-                "parsed_data": parsed,
-                "extraction_method": "traditional_ocr",
-                "confidence": "high" if len(text.strip()) > 50 else "low",
-            }
+            if not text.strip(): return {"error":"No text extracted","method":"traditional_ocr"}
+            return {"raw_text":text, "parsed_data": self._parse_ocr_text(text),
+                    "extraction_method":"traditional_ocr",
+                    "confidence":"high" if len(text.strip())>50 else "low"}
         except Exception as e:
-            logger.error(f"Traditional OCR failed: {e}")
-            return {"error": f"Traditional OCR failed: {e}", "method": "traditional_ocr"}
+            log.error(f"traditional_ocr: {e}")
+            return {"error":f"Traditional OCR failed: {e}", "method":"traditional_ocr"}
 
-    def _extract_with_vision_model(self, image_data: bytes) -> Dict:
-        """Extract data using a vision model (Ollama) from image bytes."""
+    def _vision_extract(self, img_bytes: bytes) -> Dict:
+        """Call Ollama vision with raw bytes (already normalized)."""
         try:
-            response = ollama.chat(
+            client = _ollama_client(ensure=self.model)
+            resp = client.chat(
                 model=self.model,
-                messages=[{
-                    "role": "user",
-                    "content": self._get_optimized_prompt(),
-                    "images": [image_data],
-                }]
+                messages=[{"role":"user","content": self._prompt(),"images":[img_bytes]}]
             )
-            content = response.get("message", {}).get("content", "")
-            if not content:
-                return {"error": "No response content from vision model"}
-            parsed = self._parse_chat_response(content)
-            return {
-                "raw_response": content,
-                "parsed_data": parsed,
-                "extraction_method": "vision_model",
-                "model_used": self.model,
-            }
+            content = resp.get("message", {}).get("content", "")
+            if not content: return {"error":"No response content from vision model"}
+            return {"raw_response": content, "parsed_data": self._parse_chat_response(content),
+                    "extraction_method":"vision_model","model_used": self.model}
         except Exception as e:
-            logger.error(f"Vision model extraction failed for {self.model}: {e}")
-            msg = str(e)
-            if "tool" in msg.lower():
-                return {"error": f"Tool support issue: {msg}"}
-            if "image" in msg.lower():
-                return {"error": f"Image support issue: {msg}"}
-            return {"error": f"Vision model failed: {msg}"}
+            log.error(f"vision_extract: {e}")
+            return {"error": f"Ollama error: {e}"}
 
-    # -------------------- Parsing helpers --------------------
-
+    # ----- Parsing -----
     def _parse_ocr_text(self, text: str) -> dict:
         """
-        Parse OCR text for receipts with a 'Description / Qty / Unit Price / Total' table
-        followed by a summary block with Subtotal / Tax / Total.
-
-        - Extracts Company Name (first plausible header line)
-        - Parses items as 4-line blocks (desc, qty, unit, total)
-        - Extracts Subtotal, Sales Tax (or VAT), and Total separately
-        - If Total is missing or equals Subtotal while Tax exists, computes Total = Subtotal + Tax
+        Robust parser for Vision OCR AND text-based PDFs.
+        - Supports qty-first and desc-first single-line items.
+        - Handles multi-line (2/3/4-line) item layouts.
+        - Captures Subtotal/Tax/Total even when amounts are on following lines.
+        - Reconciles totals from items.
+        - Infers `category` for each item from description keywords.
         """
         import re
+        from typing import Optional, List
 
         # ---------- helpers ----------
-        MONEY = r"\$?\d{1,3}(?:,\d{3})*(?:\.\d{2})"
+        MONEY = r"\$?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})"
+        MONEY_RE = re.compile(MONEY)
+        INT_RE = re.compile(r"\d+")
+
+        def normalize_ws(s: str) -> str:
+            s = (s.replace("\u00a0", " ")
+                .replace("\u2009", " ")
+                .replace("\u202f", " ")
+                .replace("\t", " ")
+                .replace("|", " "))
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
 
         def is_money(s: str) -> bool:
-            return bool(re.fullmatch(MONEY, s.strip()))
+            return bool(MONEY_RE.fullmatch(s.strip()))
+
+        def first_money(s: str) -> Optional[str]:
+            m = MONEY_RE.search(s)
+            return m.group(0) if m else None
 
         def norm_money(s: str) -> str:
-            s = s.strip()
-            return s if s.startswith("$") else f"${s}" if is_money(s) else s
+            s = s.strip().replace(" ", "")
+            if s and not s.startswith("$") and is_money(s):
+                return f"${s}"
+            return s
 
-        def to_float(m: str) -> float:
-            return float(m.replace("$", "").replace(",", ""))
+        def money_to_float(s: str) -> float:
+            return float(s.replace("$", "").replace(",", "").replace(" ", ""))
 
-        def is_qty(s: str) -> bool:
-            return bool(re.fullmatch(r"\d+", s.strip()))
+        def maybe_money_to_float(s: Optional[str]) -> Optional[float]:
+            try:
+                return money_to_float(s) if s else None
+            except Exception:
+                return None
 
-        def is_col_header(s: str) -> bool:
-            s = s.strip().lower()
-            return s in {"description", "qty", "quantity", "unit price", "price", "total"}
+        def find_qty(s: str) -> Optional[str]:
+            m = INT_RE.search(s.strip())
+            return m.group(0) if m else None
 
-        def next_nonempty_amount(idx: int) -> str | None:
-            j = idx + 1
-            while j < len(lines) and not lines[j].strip():
-                j += 1
-            if j < len(lines) and is_money(lines[j]):
-                return norm_money(lines[j])
+        def is_header_token(s: str) -> bool:
+            ss = s.lower()
+            return ss in {"description", "qty", "quantity", "unit price", "price", "total"}
+
+        def looks_like_header_line(s: str) -> bool:
+            ss = s.lower()
+            return any(tok in ss for tok in ("description", "qty", "quantity", "unit price", "price", "total"))
+
+        def is_summary_keyword(s: str) -> Optional[str]:
+            ss = s.lower()
+            if re.search(r"\bsub\s*total\b|^subtotal\b", ss): return "subtotal"
+            if re.search(r"\b(?:tax|vat|gst|sales\s*tax)\b", ss): return "tax"
+            if re.search(r"\b(?:grand\s+)?total\b", ss): return "total"
             return None
 
-        # ---------- prep ----------
-        lines = [ln.strip() for ln in text.splitlines()]
-        lines = [ln for ln in lines if ln]  # drop blanks
-        low_lines = [ln.lower() for ln in lines]
+        def grab_amount_inline_or_following(lines: List[str], i: int, max_lookahead: int = 3) -> Optional[str]:
+            m = MONEY_RE.search(lines[i])
+            if m:
+                return norm_money(m.group(0))
+            hops = 0
+            j = i + 1
+            while j < len(lines) and hops < max_lookahead:
+                if lines[j].strip():
+                    m2 = MONEY_RE.search(lines[j])
+                    if m2:
+                        return norm_money(m2.group(0))
+                    hops += 1
+                j += 1
+            return None
 
-        # ---------- Company Name ----------
+        # Category inference
+        def _infer_category(desc: str) -> str:
+            d = desc.lower()
+            if any(k in d for k in ["room", "suite", "stay", "accommodation", "nightly rate", "night rate", "rate"]):
+                return "Lodging"
+            if any(k in d for k in ["restaurant", "bar", "meal", "breakfast", "lunch", "dinner",
+                                    "minibar", "mini bar", "room service", "cafe", "coffee", "beverage", "drink"]):
+                return "Food & Beverage"
+            if any(k in d for k in ["laundry", "dry clean", "dry-clean", "pressing"]):
+                return "Laundry"
+            if any(k in d for k in ["parking", "valet", "shuttle", "taxi", "uber", "lyft", "transport"]):
+                return "Parking/Transport"
+            if any(k in d for k in ["spa", "massage", "wellness", "fitness", "gym"]):
+                return "Spa/Wellness"
+            if any(k in d for k in ["wifi", "wi-fi", "internet", "phone", "data"]):
+                return "Telecom"
+            if any(k in d for k in ["resort fee", "service charge", "surcharge", "convenience fee", "processing fee"]):
+                return "Fees/Surcharges"
+            if any(k in d for k in ["tip", "gratuity"]):
+                return "Tips/Gratuity"
+            return "Miscellaneous"
+
+        # ---------- pre-process ----------
+        raw_lines = text.splitlines()
+        lines = [normalize_ws(ln) for ln in raw_lines if normalize_ws(ln)]
+        low = [ln.lower() for ln in lines]
+
+        # ---------- company ----------
         company = ""
         for ln in lines[:8]:
-            if ln.startswith("---"):            # page marker
+            if ln.startswith("---"):
                 continue
-            if ":" in ln:                       # meta fields like "Phone: ..."
+            if ":" in ln:
                 continue
-            if is_col_header(ln):               # table headers
+            if looks_like_header_line(ln) or re.search(r"\b(receipt|invoice|statement)\b", ln, re.I):
                 continue
-            if re.search(r"receipt|invoice|statement", ln, re.IGNORECASE):
-                continue
-            if is_money(ln) or is_qty(ln):      # not a numeric/price-only line
+            if MONEY_RE.search(ln):
                 continue
             company = ln
             break
 
-        # ---------- Date ----------
+        # ---------- date ----------
         date_val = None
-        # Prefer explicit meta like "Check-in Date: 2025-08-01"
         for ln in lines:
-            m = re.search(r"(check-?in|check in)\s*date[:\s]+(.+)$", ln, re.IGNORECASE)
+            m = re.search(r"(check-?in|check in|\bdate\b)[:\s]+(.+)$", ln, re.I)
             if m:
                 m2 = re.search(r"(\d{4}[/-]\d{1,2}[/-]\d{1,2})|(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", m.group(2))
                 if m2:
-                    date_val = m2.group()
+                    date_val = m2.group().strip()
                     break
-        # Else first date-like token anywhere
         if not date_val:
             for ln in lines:
                 m = re.search(r"(\d{4}[/-]\d{1,2}[/-]\d{1,2})|(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", ln)
                 if m:
-                    date_val = m.group()
+                    date_val = m.group().strip()
                     break
 
-        # ---------- Locate table header (Description / ... / Total) ----------
-        header_idx = None
-        for i in range(len(lines)):
-            win = {lines[i].lower()}
-            if i + 1 < len(lines): win.add(lines[i+1].lower())
-            if i + 2 < len(lines): win.add(lines[i+2].lower())
-            if i + 3 < len(lines): win.add(lines[i+3].lower())
-            if {"description", "total"}.issubset({w.strip().lower() for w in win}):
-                header_idx = i
-                break
-
-        # ---------- Items (parse as 4-line blocks) ----------
-        items = []
-        items_end_idx = None
-        if header_idx is not None:
-            j = header_idx
-            while j < len(lines) and is_col_header(lines[j]):
-                j += 1
-
-            while j + 3 < len(lines):
-                # Stop if entering a summary label
-                if re.search(r"^\s*(sub\s*total|subtotal|tax|vat|total|grand\s+total)\b", lines[j], re.IGNORECASE):
-                    items_end_idx = j
+        # ---------- locate multi-line header block ----------
+        header_end = None
+        for i, ln in enumerate(lines):
+            if "description" in ln.lower():
+                j = i
+                seen = 0
+                while j < len(lines) and is_header_token(lines[j]):
+                    seen += 1
+                    header_end = j
+                    j += 1
+                if seen >= 2:
                     break
 
-                desc, qty, unit, tot = lines[j], lines[j+1], lines[j+2], lines[j+3]
-                desc_ok = (not is_col_header(desc)) and (":" not in desc) and (not is_money(desc)) and (not is_qty(desc))
-                if desc_ok and is_qty(qty) and is_money(unit) and is_money(tot):
+        start_i = (header_end + 1) if header_end is not None else 0
+
+        # ---------- item patterns ----------
+        # desc first: "Room Charge 4 $200.00 $800.00"
+        SINGLE_ITEM = re.compile(
+            rf"""^
+                (?P<desc>.+?)\s+
+                (?P<qty>\d+)\s+
+                (?P<unit>{MONEY})\s+
+                (?P<total>{MONEY})\s*$
+            """,
+            re.VERBOSE | re.IGNORECASE
+        )
+        # qty first: "2 Custom product A 45.00 90.00"
+        QTY_FIRST_ITEM = re.compile(
+            rf"""^
+                (?P<qty>\d+)\s+
+                (?P<desc>.+?)\s+
+                (?P<unit>{MONEY})\s+
+                (?P<total>{MONEY})\s*$
+            """,
+            re.VERBOSE | re.IGNORECASE
+        )
+
+        items: List[dict] = []
+        subtotal_val = tax_val = total_val = None
+
+        # ---------- scan all lines (no early cutoff) ----------
+        i = start_i
+        while i < len(lines):
+            ln = lines[i]
+
+            # Capture summary anywhere
+            key = is_summary_keyword(ln)
+            if key == "subtotal" and not subtotal_val:
+                got = grab_amount_inline_or_following(lines, i)
+                if got: subtotal_val = got
+            elif key == "tax" and not tax_val:
+                got = grab_amount_inline_or_following(lines, i)
+                if got: tax_val = got
+            elif key == "total" and not total_val:
+                got = grab_amount_inline_or_following(lines, i)
+                if got: total_val = got
+
+            # Skip obvious non-item lines
+            if looks_like_header_line(ln) or (":" in ln and not ln.lower().startswith("total")):
+                i += 1
+                continue
+
+            # 1) qty-first single line
+            m = QTY_FIRST_ITEM.match(ln)
+            if m:
+                desc = m.group("desc").strip()
+                items.append({
+                    "description": desc,
+                    "quantity": m.group("qty").strip(),
+                    "unit_price": norm_money(m.group("unit")),
+                    "total": norm_money(m.group("total")),
+                    "category": _infer_category(desc),
+                })
+                i += 1
+                continue
+
+            # 2) desc-first single line
+            m = SINGLE_ITEM.match(ln)
+            if m:
+                desc = m.group("desc").strip()
+                items.append({
+                    "description": desc,
+                    "quantity": m.group("qty").strip(),
+                    "unit_price": norm_money(m.group("unit")),
+                    "total": norm_money(m.group("total")),
+                    "category": _infer_category(desc),
+                })
+                i += 1
+                continue
+
+            # 3) two-line: desc / (qty unit total)
+            if i + 1 < len(lines):
+                l1 = lines[i + 1]
+                qty = find_qty(l1)
+                monies = MONEY_RE.findall(l1)
+                if qty and len(monies) >= 2 and not looks_like_header_line(ln) and not is_money(ln):
+                    desc = ln.strip()
+                    items.append({
+                        "description": desc,
+                        "quantity": qty,
+                        "unit_price": norm_money(monies[0]),
+                        "total": norm_money(monies[1]),
+                        "category": _infer_category(desc),
+                    })
+                    i += 2
+                    continue
+
+            # 4) three-line: desc / qty / (unit total)
+            if i + 2 < len(lines):
+                l1, l2 = lines[i + 1], lines[i + 2]
+                qty = find_qty(l1)
+                monies = MONEY_RE.findall(l2)
+                if qty and len(monies) >= 2 and not looks_like_header_line(ln) and not is_money(ln):
+                    desc = ln.strip()
+                    items.append({
+                        "description": desc,
+                        "quantity": qty,
+                        "unit_price": norm_money(monies[0]),
+                        "total": norm_money(monies[1]),
+                        "category": _infer_category(desc),
+                    })
+                    i += 3
+                    continue
+
+            # 5) four-line: desc / qty / unit / total
+            if i + 3 < len(lines):
+                l1, l2, l3 = lines[i + 1], lines[i + 2], lines[i + 3]
+                qty = find_qty(l1)
+                unit = first_money(l2)
+                tot  = first_money(l3)
+                if qty and unit and tot and not looks_like_header_line(ln) and not is_money(ln):
+                    desc = ln.strip()
                     items.append({
                         "description": desc,
                         "quantity": qty,
                         "unit_price": norm_money(unit),
                         "total": norm_money(tot),
-                        "category": ""
+                        "category": _infer_category(desc),
                     })
-                    j += 4
-                else:
-                    j += 1  # resync
-            if items_end_idx is None:
-                items_end_idx = j  # if we ran out
+                    i += 4
+                    continue
 
-        # ---------- Summary block (Subtotal / Tax / Total) ----------
-        # Only search **after** items_end_idx to avoid the "Total" column header.
-        start_summary = items_end_idx if items_end_idx is not None else 0
+            # 6) token fallback: last two monies + nearest integer before them (qty),
+            #    allowing qty at position 0 (qty-first lines).
+            tokens = ln.split()
+            money_pos = [(idx, t) for idx, t in enumerate(tokens) if is_money(t)]
+            if len(money_pos) >= 2:
+                idx2, m2 = money_pos[-1]
+                idx1, m1 = money_pos[-2]
+                qty_idx = None
+                for qidx in range(idx1 - 1, -1, -1):
+                    if INT_RE.fullmatch(tokens[qidx]):
+                        qty_idx = qidx
+                        break
+                if qty_idx is not None:
+                    if qty_idx == 0:
+                        # qty-first: desc is between qty and the first money
+                        desc = " ".join(tokens[qty_idx + 1:idx1]).strip()
+                    else:
+                        # desc-first
+                        desc = " ".join(tokens[:qty_idx]).strip()
+                    if desc:
+                        unit, tot = m1, m2
+                        try:
+                            if money_to_float(unit) > money_to_float(tot):
+                                unit, tot = tot, unit
+                        except Exception:
+                            pass
+                        items.append({
+                            "description": desc,
+                            "quantity": tokens[qty_idx],
+                            "unit_price": norm_money(unit),
+                            "total": norm_money(tot),
+                            "category": _infer_category(desc),
+                        })
+                        i += 1
+                        continue
 
-        subtotal_val = None
-        tax_val = None
-        total_val = None
+            i += 1
 
-        for i in range(start_summary, len(lines)):
-            ln = lines[i]
-            low = low_lines[i]
+        # ---------- reconciliation ----------
+        computed_subtotal = None
+        if items:
+            totals = [maybe_money_to_float(it["total"]) for it in items]
+            totals = [t for t in totals if t is not None]
+            if totals:
+                computed_subtotal = round(sum(totals) + 1e-9, 2)
 
-            # Subtotal
-            if subtotal_val is None and re.search(r"\bsub\s*total\b|^subtotal\b", low):
-                # amount on same line or next non-empty line
-                m = re.search(MONEY + r"\s*$", ln)
-                if m:
-                    subtotal_val = norm_money(m.group())
-                else:
-                    maybe = next_nonempty_amount(i)
-                    if maybe: subtotal_val = maybe
-                continue
+        def parse_money_safe(s: Optional[str]) -> Optional[float]:
+            try:
+                return money_to_float(s) if s else None
+            except Exception:
+                return None
 
-            # Tax / VAT (capture first; you can extend to collect multiple)
-            if tax_val is None and re.search(r"\b(tax|vat)\b", low) and not re.search(r"\bno\s*tax\b", low):
-                m = re.search(MONEY + r"\s*$", ln)
-                if m:
-                    tax_val = norm_money(m.group())
-                else:
-                    maybe = next_nonempty_amount(i)
-                    if maybe: tax_val = maybe
-                continue
+        if computed_subtotal is not None:
+            sub_f = parse_money_safe(subtotal_val)
+            if (sub_f is None) or (abs(sub_f - computed_subtotal) > 0.01):
+                subtotal_val = f"${computed_subtotal:.2f}"
 
-            # Total / Grand Total (explicit summary, not the table header)
-            if re.fullmatch(r"(?i)(?:grand\s+)?total[:\s]*.*", ln):
-                m = re.search(MONEY + r"\s*$", ln)
-                if m:
-                    total_val = norm_money(m.group())
-                else:
-                    maybe = next_nonempty_amount(i)
-                    if maybe: total_val = maybe
-                continue
+        tax_f = parse_money_safe(tax_val)
+        sub_f = parse_money_safe(subtotal_val)
+        if tax_f is not None and sub_f is not None:
+            total_val = f"${sub_f + tax_f:.2f}"
 
-        # Fallbacks / corrections
-        if total_val is None and subtotal_val and tax_val:
-            # If total not present, compute it
-            total_val = f"${to_float(subtotal_val) + to_float(tax_val):.2f}"
-
-        # Guard against "Total == Subtotal" when Tax exists (table-header confusion)
-        if total_val and subtotal_val and tax_val:
-            if abs(to_float(total_val) - to_float(subtotal_val)) < 0.005:
-                total_val = f"${to_float(subtotal_val) + to_float(tax_val):.2f}"
-
-        # As a last resort (no explicit summary), pick the maximum money AFTER the items section
         if total_val is None:
-            monies_after = re.findall(MONEY, "\n".join(lines[start_summary:]))
-            if monies_after:
-                total_val = norm_money(max(monies_after, key=lambda s: to_float(s)))
+            # fall back to max money in doc
+            monies = [money_to_float(m.group()) for m in MONEY_RE.finditer("\n".join(lines))]
+            if monies:
+                total_val = f"${max(monies):.2f}"
 
-        # ---------- Build result ----------
-        parsed: dict = {}
-        if company: parsed["Company Name"] = company
-        if date_val: parsed["Date"] = date_val
-        if items: parsed["Items"] = items
-        if subtotal_val: parsed["Subtotal"] = subtotal_val
-        if tax_val: parsed["Sales Tax"] = tax_val   # matches your template key
-        if total_val: parsed["Total"] = total_val
+        # ---------- build ----------
+        out: dict = {}
+        if company: out["Company Name"] = company
+        if date_val: out["Date"] = date_val
+        if items: out["Items"] = items
+        if subtotal_val: out["Subtotal"] = subtotal_val
+        if tax_val: out["Sales Tax"] = tax_val
+        if total_val: out["Total"] = total_val
+        out["raw_text"] = text
+        return out
 
-        return parsed
+
+
 
 
     def _parse_chat_response(self, content: str) -> Dict:
-        """Try to pull structured fields from the model's text response."""
-        try:
-            import re
-            # Try JSON
-            m = re.search(r"\{.*\}", content, re.DOTALL)
-            if m:
-                try:
-                    j = json.loads(m.group())
-                    cleaned = {k: v for k, v in j.items()
-                               if str(v).strip() and str(v).lower() not in ["n/a", "unknown", "not found"]}
-                    if cleaned:
-                        return cleaned
-                except json.JSONDecodeError:
-                    pass
+        import re
+        m=re.search(r"\{.*\}", content, re.DOTALL)
+        if m:
+            try:
+                j=json.loads(m.group())
+                cleaned={k:v for k,v in j.items() if str(v).strip() and str(v).lower() not in {"n/a","unknown","not found"}}
+                if cleaned: return cleaned
+            except json.JSONDecodeError:
+                pass
+        parsed={}
+        pats={"company_name":r"(?:store|company|business)[:\s]+([^\n]+)",
+              "total":r"(?:total|amount)[:\s]*\$?([\d,]+\.?\d*)",
+              "date":r"(?:date)[:\s]+([^\n]+)"}
+        for k,p in pats.items():
+            mm=re.search(p, content, re.I)
+            if mm:
+                v=mm.group(1).strip()
+                if v and v.lower() not in {"n/a","unknown","not found"}: parsed[k]=v
+        parsed["raw_response"]=content
+        return parsed
 
-            parsed = {}
-            patterns = {
-                "company_name": r"(?:store|company|business)[:\s]+([^\n]+)",
-                "total": r"(?:total|amount)[:\s]*\$?([\d,]+\.?\d*)",
-                "date": r"(?:date)[:\s]+([^\n]+)",
-            }
-            for key, pat in patterns.items():
-                mm = re.search(pat, content, re.IGNORECASE)
-                if mm:
-                    val = mm.group(1).strip()
-                    if val and val.lower() not in ["n/a", "unknown", "not found"]:
-                        parsed[key] = val
-            parsed["raw_response"] = content
-            return parsed
-        except Exception as e:
-            logger.warning(f"Failed to parse chat response: {e}")
-            return {"raw_text": content}
-
-    # -------------------- Public API (bytes) --------------------
-
-    def extract_receipt_data_from_bytes(self, data: bytes, source_name: str = "upload") -> Dict:
+    # ----- Public API -----
+    def extract_receipt_data_from_bytes(self, data, source_name: str = "upload") -> Dict:
         """
-        Main entrypoint: pass raw bytes of an image or a PDF.
-        Returns structured extraction results.
+        Pass raw bytes (preferred), or a base64 / data-URL string.
+        Auto-detects PDF vs image; uses text extraction for text-PDFs,
+        and vision for images/image-PDFs. Hybrid OCR tried first on images if enabled.
         """
-        start_time = time.time()
+        t0 = time.time()
         try:
-            if _looks_like_pdf(data):
-                logger.info(f"Processing PDF bytes for {source_name}")
-                pdf_analysis = self._analyze_pdf_content_bytes(data)
-                logger.info(f"PDF analysis: {pdf_analysis}")
+            payload = _normalize_to_bytes(data) if not isinstance(data, (bytes, bytearray)) else bytes(data)
+            kind = _detect_payload_type(payload)
 
-                if pdf_analysis.get("type") == "text":
-                    # Prefer direct text extraction but also compare against image render
-                    text_result = self._extract_text_from_pdf_bytes(data)
-                    if "error" not in text_result:
-                        image_bytes = self._pdf_to_image_bytes(data)
-                        if image_bytes:
-                            image_result = self._process_image_bytes(image_bytes)
-                            comparison = self._compare_text_vs_image_results(text_result, image_result)
-                            comparison["processing_time"] = time.time() - start_time
-                            comparison["pdf_processing"] = True
-                            comparison["pdf_analysis"] = pdf_analysis
-                            return comparison
-                        # Only text path succeeded
-                        text_result["processing_time"] = time.time() - start_time
-                        return text_result
-                    else:
-                        # Text failed; try image path
-                        image_bytes = self._pdf_to_image_bytes(data)
-                        if not image_bytes:
-                            return {"error": "Failed to process PDF as image and text extraction failed"}
-                        return self._process_image_bytes(image_bytes)
-                else:
-                    # Image-based PDF
-                    image_bytes = self._pdf_to_image_bytes(data)
-                    if not image_bytes:
-                        return {"error": "PDF seems image-based but conversion failed"}
-                    result = self._process_image_bytes(image_bytes)
-                    result["pdf_processing"] = True
+            if kind == "pdf":
+                log.info(f"Processing PDF bytes for {source_name}")
+                analysis = self._analyze_pdf_bytes(payload)
+                log.info(f"PDF analysis: {analysis}")
+
+                if analysis.get("type") == "text":
+                    # Text-based PDF: direct text extraction (no vision)
+                    result = self._extract_text_from_pdf_bytes(payload)
+                    result["processing_time"] = time.time() - t0
                     return result
+
+                # Image-based PDF: render to PNG, then do image path
+                img = self._pdf_firstpage_to_png_bytes(payload)
+                if not img:
+                    return {"error":"PDF seems image-based but conversion failed", "processing_time": time.time() - t0}
+                res = self._process_image_bytes(img)
+                res["pdf_processing"] = True
+                return res
+
+            elif kind == "image":
+                return self._process_image_bytes(payload)
+
             else:
-                # Regular image
-                return self._process_image_bytes(data)
+                return {"error":"Unsupported payload type (not a valid PDF or image)", "processing_time": time.time() - t0}
+
         except Exception as e:
-            logger.error(f"Error processing buffer for {source_name}: {e}")
+            log.error(f"buffer processing error for {source_name}: {e}")
+            return {"error":str(e), "source":source_name, "timestamp":datetime.now().isoformat(),
+                    "processing_time": time.time() - t0}
+
+    def _extract_text_from_pdf_bytes(self, b: bytes) -> Dict:
+        if not PYPDF2:
+            return {"error":"PDF text extraction unavailable (PyPDF2 not installed)"}
+        try:
+            r=PyPDF2.PdfReader(io.BytesIO(b)); text=""
+            for i,p in enumerate(r.pages,1):
+                t=p.extract_text() or ""
+                if t: text += f"\n--- Page {i} ---\n{t}"
+            if not text.strip(): return {"error":"No text content found in PDF"}
+            parsed = self._parse_ocr_text(text)
             return {
-                "error": str(e),
-                "source": source_name,
-                "timestamp": datetime.now().isoformat(),
-                "processing_time": time.time() - start_time
+                "raw_text": text,
+                "parsed_data": parsed,
+                "extraction_method": "pdf_text_extraction",
+                "confidence": "high" if len(text.strip()) > 100 else "low"
             }
+        except Exception as e:
+            log.error(f"pdf text extraction failed: {e}")
+            return {"error":f"PDF text extraction failed: {e}"}
 
-    def _process_image_bytes(self, image_bytes: bytes) -> Dict:
-        """Run hybrid OCR then LLM vision on raw image bytes."""
-        start_time = time.time()
-
-        # Try traditional OCR (fast path)
+    def _process_image_bytes(self, img_bytes: bytes) -> Dict:
+        t0 = time.time()
+        # Try traditional OCR first (fast) if available
         if self.use_hybrid_ocr:
-            logger.info("Attempting traditional OCR first...")
-            ocr_result = self._extract_with_traditional_ocr_bytes(image_bytes)
-            if "error" not in ocr_result and ocr_result.get("confidence") == "high":
+            log.info("Attempting traditional OCR first...")
+            ocr = self._traditional_ocr(img_bytes)
+            if "error" not in ocr and ocr.get("confidence") == "high":
+                ocr["processing_time"] = time.time() - t0
                 self.processing_stats["traditional_ocr_success"] += 1
-                ocr_result["processing_time"] = time.time() - start_time
-                logger.info(f"Traditional OCR successful in {ocr_result['processing_time']:.2f}s")
-                return ocr_result
-
-        # Vision model (optimize image first)
-        logger.info("Using vision model for extraction...")
+                log.info(f"Traditional OCR successful in {ocr['processing_time']:.2f}s")
+                return ocr
+        # Use vision
+        log.info("Using vision model for extraction...")
         self.processing_stats["vision_model_used"] += 1
+        optimized = self._optimize_image_bytes(img_bytes)
+        res = self._vision_extract(optimized)
+        res["processing_time"] = time.time() - t0
+        log.info(f"Vision model done in {res['processing_time']:.2f}s")
+        return res
 
-        if not self._test_model_compatibility():
-            logger.warning(f"Model {self.model} may not support vision input")
-            fallback = self._get_fallback_model()
-            if fallback != self.model:
-                logger.info(f"Switching to fallback model: {fallback}")
-                original = self.model
-                self.model = fallback
-                if not self._test_model_compatibility():
-                    logger.error("Fallback model also failed vision test")
-                    self.model = original
-                    return {"error": "No compatible vision model available"}
-
-        optimized = self._optimize_image_bytes(image_bytes)
-        result = self._extract_with_vision_model(optimized)
-        result["processing_time"] = time.time() - start_time
-        logger.info(f"Vision model processing completed in {result['processing_time']:.2f}s")
-        return result
-
-    # -------------------- Result persistence --------------------
-
+    # ----- Comparison & Save (kept for parity; not used in text-PDF path) -----
     def save_results(self, results: Dict, source_name: str = "upload") -> Path:
-        """Save extraction results to file (source_name is used for metadata & filename)."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_name = self.model.split(":")[0] if ":" in self.model else self.model
-        safe_name = (
-            source_name.replace("/", "_").replace("\\", "_").replace(" ", "_")[:40]
-            or "upload"
-        )
-        filename = f"{safe_name}_{model_name}_optimized_{timestamp}.json"
-        output_path = self.output_dir / filename
-
-        results_with_metadata = {
+        safe = (source_name.replace("/","_").replace("\\","_").replace(" ","_")[:40] or "upload")
+        out = self.output_dir / f"{safe}_{model_name}_optimized_{ts}.json"
+        payload = {
             "metadata": {
-                "source_name": source_name,
-                "model_used": self.model,
-                "extraction_timestamp": timestamp,
-                "processing_time": results.get("processing_time", 0),
+                "source_name": source_name, "model_used": self.model,
+                "extraction_timestamp": ts, "processing_time": results.get("processing_time",0),
                 "optimization_settings": {
                     "max_image_size": self.max_image_size,
                     "use_grayscale": self.use_grayscale,
                     "use_hybrid_ocr": self.use_hybrid_ocr,
-                    "compression_quality": self.compression_quality,
-                },
+                    "compression_quality": self.compression_quality
+                }
             },
-            "results": results,
+            "results": results
         }
+        json.dump(payload, open(out,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
+        log.info(f"Results saved to {out}")
+        return out
 
-        try:
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(results_with_metadata, f, indent=2, ensure_ascii=False)
-            logger.info(f"Results saved to {output_path}")
-            return output_path
-        except Exception as e:
-            logger.error(f"Error saving results: {e}")
-            raise
-
-    # -------------------- Comparison (text vs image) --------------------
-
-    def _compare_text_vs_image_results(self, text_result: Dict, image_result: Dict) -> Dict:
-        logger.info("Comparing text-based vs image-based extraction results")
-        text_score = 0
-        image_score = 0
-
-        def score_fields(d: Dict) -> int:
-            return len([k for k, v in d.get("parsed_data", {}).items() if str(v).strip()])
-
-        tf = score_fields(text_result)
-        imf = score_fields(image_result)
-        if tf > imf:
-            text_score += 2
-        elif imf > tf:
-            image_score += 2
-
-        tt = text_result.get("processing_time", 0)
-        it = image_result.get("processing_time", 0)
-        if tt < it:
-            text_score += 1
-        elif it < tt:
-            image_score += 1
-
-        conf_map = {"high": 3, "medium": 2, "low": 1}
-        text_score += conf_map.get(text_result.get("confidence", "low"), 1)
-        image_score += conf_map.get(image_result.get("confidence", "low"), 1)
-
-        if text_score > image_score:
-            winner = "text"
-        elif image_score > text_score:
-            winner = "image"
-        else:
-            winner = "text"  # prefer faster path on tie
-
-        return {
-            "winner": winner,
-            "text_result": text_result,
-            "image_result": image_result,
-            "comparison_scores": {
-                "text_score": text_score,
-                "image_score": image_score,
-                "text_fields": tf,
-                "image_fields": imf,
-                "text_time": tt,
-                "image_time": it,
-                "text_confidence": text_result.get("confidence", "low"),
-                "image_confidence": image_result.get("confidence", "low"),
-            },
-            "extraction_method": f"pdf_{winner}_based",
-            "pdf_processing": True,
-        }
-
-    # -------------------- Model capability helpers --------------------
-
-    def _get_model_info(self) -> Dict:
-        try:
-            info = ollama.show(self.model)
-            return {
-                "name": info.get("name", self.model),
-                "family": info.get("family", "unknown"),
-                "parameter_size": info.get("parameter_size", "unknown"),
-                "modelfile": info.get("modelfile", ""),
-            }
-        except Exception as e:
-            logger.warning(f"Could not get model info for {self.model}: {e}")
-            return {"name": self.model, "family": "unknown", "parameter_size": "unknown", "modelfile": ""}
-
-    def _is_vision_model(self) -> bool:
-        mf = self._get_model_info().get("modelfile", "").lower()
-        return any(k in mf for k in ["vision", "llava", "clip", "image", "multimodal"])
-
-    def _test_model_compatibility(self) -> bool:
-        try:
-            test_image = (
-                b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00"
-                b"\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t"
-                b"\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a\x1f"
-                b"\x1e\x1d\x1a\x1c\x1c $.' \",#\x1c\x1c(7),01444\x1f'9=82<.342"
-                b"\xff\xc0\x00\x11\x08\x00\x01\x00\x01\x01\x01\x11\x00\x02\x11\x01"
-                b"\x03\x11\x01\xff\xc4\x00\x14\x00\x01\x00\x00\x00\x00\x00\x00\x00"
-                b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x08\xff\xc4\x00\x14\x10\x01"
-                b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-                b"\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00?\x00\xaa\xff\xd9"
-            )
-            ollama.chat(
-                model=self.model,
-                messages=[{"role": "user", "content": "Test message", "images": [test_image]}]
-            )
-            return True
-        except Exception as e:
-            logger.warning(f"Model {self.model} may not support vision: {e}")
-            return False
-
-    def _get_fallback_model(self) -> str:
-        try:
-            available = [m["name"] for m in ollama.list()["models"]]
-        except Exception as e:
-            logger.warning(f"Could not get available models: {e}")
-            available = []
-        preferred = ["llava:latest", "minicpm-v:latest", "granite3.2-vision:latest"]
-        for m in preferred:
-            if m in available and m != self.model:
-                return m
-        for m in available:
-            if m != self.model:
-                return m
-        return self.model
-
-# -------------------- CLI (still in-memory) --------------------
-
+# ---------- CLI ----------
 def main():
-    """
-    Example CLI for local testing.
-    In production/API: call `extract_receipt_data_from_bytes(upload_bytes, source_name)`
-    and `save_results(...)` if you want to persist the output.
-    """
-    parser = argparse.ArgumentParser(
-        description="Optimized Receipt OCR Scanner (buffer-based)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python receipt_ocr_scanner.py --input ./Receipts/sample.jpg
-  python receipt_ocr_scanner.py --input ./Receipts/sample.pdf --model llava:latest
-        """
-    )
-
-    parser.add_argument("--model", default="llava:7b", help="Vision model to use")
-    parser.add_argument("--input", required=True, help="Path to a single file (image or PDF)")
-    parser.add_argument("--output-dir", default="./Reports", help="Where to save JSON results")
-    parser.add_argument("--max-image-size", type=int, default=800, help="Max dimension for resizing")
-    parser.add_argument("--use-grayscale", action="store_true", default=True, help="Enable grayscale")
-    parser.add_argument("--no-grayscale", dest="use_grayscale", action="store_false", help="Disable grayscale")
-    parser.add_argument("--hybrid-ocr", action="store_true", default=True, help="Use pytesseract first")
-    parser.add_argument("--no-hybrid-ocr", dest="use_hybrid_ocr", action="store_false", help="Disable pytesseract")
-    parser.add_argument("--compression-quality", type=int, default=85, help="JPEG quality 1-100")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
-
-    args = parser.parse_args()
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+    import argparse
+    p = argparse.ArgumentParser(description="Receipt OCR Scanner (buffer-based)")
+    p.add_argument("--model", default="llava:7b")
+    p.add_argument("--input", required=True, help="Path to image or PDF")
+    p.add_argument("--output-dir", default="./Reports")
+    p.add_argument("--max-image-size", type=int, default=800)
+    p.add_argument("--use-grayscale", action="store_true", default=True)
+    p.add_argument("--no-grayscale", dest="use_grayscale", action="store_false")
+    p.add_argument("--hybrid-ocr", action="store_true", default=True)
+    p.add_argument("--no-hybrid-ocr", dest="use_hybrid_ocr", action="store_false")
+    p.add_argument("--compression-quality", type=int, default=85)
+    p.add_argument("--verbose","-v",action="store_true")
+    a = p.parse_args()
+    if a.verbose: logging.getLogger().setLevel(logging.DEBUG)
 
     scanner = OptimizedReceiptOCRScanner(
-        output_dir=args.output_dir,
-        model=args.model,
-        max_image_size=args.max_image_size,
-        use_grayscale=args.use_grayscale,
-        use_hybrid_ocr=args.use_hybrid_ocr,
-        compression_quality=args.compression_quality
+        output_dir=a.output_dir, model=a.model,
+        max_image_size=a.max_image_size, use_grayscale=a.use_grayscale,
+        use_hybrid_ocr=a.use_hybrid_ocr, compression_quality=a.compression_quality
     )
 
-    # Read file into memory once; run the same byte-oriented path used by the API
-    path = Path(args.input)
+    path = Path(a.input)
     if not path.exists() or not path.is_file():
-        logger.error(f"Input file not found: {path}")
-        sys.exit(1)
+        log.error(f"Input file not found: {path}"); sys.exit(1)
     data = path.read_bytes()
-    results = scanner.extract_receipt_data_from_bytes(data, source_name=path.name)
-    out = scanner.save_results(results, source_name=path.name)
+    res = scanner.extract_receipt_data_from_bytes(data, source_name=path.name)
+    out = scanner.save_results(res, source_name=path.name)
     print(f"Saved results: {out}")
 
 if __name__ == "__main__":

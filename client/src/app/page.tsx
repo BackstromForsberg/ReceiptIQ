@@ -6,12 +6,12 @@ export default async function Home() {
   const message = await getHello();
 
   return (
-    <div className="font-sans grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen pb-20 gap-16 sm:p-20">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
+    <div className="font-sans flex flex-col items-center justify-items-center min-h-screen p-20 gap-36 px-20 mt-40">
+      <main className="flex flex-col gap-[12px] row-start-2 items-center sm:items-start">
         <GridLayout />
-        <p>Message from Flask API: {message}</p>
+        <p>Connected to Flask API: {message}</p>
       </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
+      <footer className="row-start-3 flex flex-wrap items-center justify-center">
         <a
           className="flex items-center gap-2 hover:underline hover:underline-offset-4"
           href="https://github.com/BackstromForsberg/ReceiptIQ"
@@ -25,7 +25,7 @@ export default async function Home() {
             width={16}
             height={16}
           />
-          GitHub Repository Link
+          Powered by Larry & Ollama
         </a>
       </footer>
     </div>

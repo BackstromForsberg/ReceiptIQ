@@ -10,3 +10,4 @@ Pillow>=8.3.0
 PyMuPDF>=1.26.3
 opencv-python>=4.5.0
 PyPDF2>=3.0.0 
+requests>=2.32.0

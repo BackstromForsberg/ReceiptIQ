@@ -24,13 +24,14 @@ export async function getHello() {
 
 export async function sendPDFReceiptForOCR(
   arrayBuffer: ArrayBuffer,
-  filename = "upload.jpg"
+  filename = "upload.jpg",
+  type: "pdf" | "png" = "pdf" // Default to PDF, can be PNG
 ): Promise<any> {
   try {
     const response = await fetch(`${API}/ocr`, {
       method: "POST",
       headers: {
-        "Content-Type": "application/pdf", // Different if PNG
+        "Content-Type": type === "png" ? "image/png" : "application/pdf", // Different if PNG
         "X-Filename": filename, // Optional, passed to backend for metadata
       },
       body: arrayBuffer,
